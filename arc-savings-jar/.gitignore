@@ -1,0 +1,24 @@
+node_modules
+.next
+out
+build
+dist
+cache
+coverage
+
+# solc build output (regenerate with `npm run compile`)
+artifacts
+
+.env
+.env.local
+.env*.local
+
+*.pem
+*.log
+.DS_Store
+.vercel
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# generated, but committed so a fresh clone builds without solc
+!config/abi/savingsJar.abi.ts

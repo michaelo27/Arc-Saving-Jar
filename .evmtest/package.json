@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@nomicfoundation/ethereumjs-verkle": "^0.0.2",
+    "@nomicfoundation/ethereumjs-vm": "^7.0.4"
+  }
+}
