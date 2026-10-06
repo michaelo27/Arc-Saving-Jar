@@ -4,13 +4,13 @@
 
 Arc Savings Jar is a non-custodial savings mini-app on Arc Mainnet. A saver deposits USDC into a personal on-chain jar, chooses a lock between 24 hours and 365 days, and receives the full deposit back after the lock expires.
 
-The application is intentionally small, understandable, and useful: one wallet, several named jars, and three ways a jar that runs to maturity earns more than it put in.
+The application is intentionally small, understandable, and useful: one wallet, one active jar, one savings goal.
 
 ## What It Is
 
 Arc Savings Jar is a decentralized time-locked savings application built for Circle's EVM-compatible Arc blockchain. Funds are held by an immutable smart contract rather than by a company, administrator, or server.
 
-Each wallet can hold up to 10 active jars at once. For every jar the saver chooses the amount, lock duration, and name; the contract enforces each deadline on-chain. A jar that reaches maturity (never broken early) can also earn a reward share, a time bonus, and points - see "Incentives" below.
+Each wallet can have one active jar. The saver chooses the amount, lock duration, and jar name; the contract enforces the deadline on-chain.
 
 ## The Problem It Solves
 
@@ -30,14 +30,31 @@ Arc Savings Jar introduces intentional friction without introducing a custodian.
 
 The application checks the existing ERC-20 allowance before requesting another approval. Every successful transaction triggers an immediate data refresh.
 
+## Piggy Savings - Goal Jars and Bit-by-Bit Top-Ups 🐷
+
+Alongside classic time-locked jars, a jar can optionally carry a **savings goal** - e.g. "New Car Fund, target 5,000 USDC". Goal jars add three abilities:
+
+1. **Create with a goal.** `createGoalJar(amount, lockDuration, name, targetAmount)` opens a jar whose target is at least the initial deposit. The create form exposes this as an optional "Savings Goal" toggle.
+2. **Top up bit by bit.** `addToJar(jarId, amount)` adds USDC to an existing locked jar whenever the saver has spare funds - the piggy-bank flow. Goal jars refuse top-ups that would overshoot the target; classic jars accept top-ups freely. Top-ups are allowed right up to the maturity date.
+3. **Withdraw at the goal - or wait.** The moment a goal jar's balance reaches its target, the saver can withdraw everything early with no penalty, or simply keep the jar locked until maturity and keep earning the time bonus. Breaking a jar whose goal is already reached is refused by the contract, since a full withdrawal is strictly better.
+
+Incentive accounting stays exact across top-ups: every deposit only earns the reward share, time bonus, and points for the time *that deposit* was actually held. Each `addToJar` banks the bonus/points accrued so far and re-baselines the reward accumulator; `withdrawJar` pays the banked amounts plus the final deposit segment. The existing accounting invariant holds unchanged:
+
+```text
+balance == totalActiveDeposits + ownerFeesAccrued + rewardPoolBalance + bonusPoolBalance
+```
+
+New events: `JarToppedUp(user, jarId, added, newTotal)` and `GoalReached(user, jarId, totalSaved, targetAmount)`. New views: `isGoalReached(user, jarId)` and `goalRemaining(user, jarId)`.
+
 ## Product States
 
 The single-page interface conditionally renders four states:
 
 1. **Not connected** — product introduction, wallet connection, and feature cards.
-2. **Connected, no active jar** — jar creation form and two-step approval flow.
-3. **Active, locked jar** — liquid jar visual, second-by-second countdown, progress bar, and guarded emergency-break flow.
+2. **Connected, no active jar** — jar creation form (with the optional savings-goal toggle) and two-step approval flow.
+3. **Active, locked jar** — liquid jar visual, second-by-second countdown, progress bar, the 🐷 piggy-savings top-up card with goal progress, and guarded emergency-break flow.
 4. **Unlocked jar** — completed jar, congratulations state, and one-click full withdrawal.
+5. **Goal reached** — a goal jar that hit its target early: withdraw everything now or wait for maturity and keep earning.
 
 A wallet-free reviewer walkthrough is available at [`/demo`](http://localhost:3000/demo). It uses mock read data and never broadcasts transactions.
 
@@ -73,8 +90,7 @@ Arc uses native USDC for gas at the EVM protocol layer. The ERC-20 USDC handled 
 
 ### Core Contract Rules
 
-- Up to 10 active jars per wallet (`MAX_JARS_PER_WALLET`); each has its own name, amount, and lock.
-- `withdrawJar(jarId)` and `breakJar(jarId)` act on one jar. Closing a jar frees its slot, and the next `createJar` reuses the first free slot.
+- One active jar per wallet.
 - Amount must be greater than zero.
 - Minimum lock: 86,400 seconds (24 hours).
 - Maximum lock: 31,536,000 seconds (365 days).
@@ -97,7 +113,7 @@ Arc uses native USDC for gas at the EVM protocol layer. The ERC-20 USDC handled 
 - Discipline fees are derived as `contract USDC balance - total active deposits`, avoiding accounting drift.
 - Zero-address validation for USDC and ownership transfer.
 
-Each jar stores its own `createdAt` timestamp inside `JarData`, which gives the interface the exact elapsed-time percentage after a cold page load.
+The exact elapsed-time percentage is supported by a `jarCreatedAt` sidecar mapping. The required `JarData` structure remains unchanged.
 
 ## Repository Structure
 
@@ -109,9 +125,11 @@ arc-savings-jar/
 │   ├── layout.tsx
 │   └── page.tsx
 ├── components/
+│   ├── AddToJarCard.tsx
 │   ├── BreakJarModal.tsx
 │   ├── CountdownTimer.tsx
 │   ├── CreateJarForm.tsx
+│   ├── FundBonusPoolCard.tsx
 │   ├── Header.tsx
 │   ├── JarDashboard.tsx
 │   ├── JarVisual.tsx
@@ -196,51 +214,28 @@ npm run lint
 npm run build
 ```
 
-Run all three before every release. This revision (multi-jar + incentives) is newer than the 75-assertion behavioral suite described in earlier revisions of this README - treat that result as covering the single-jar, no-incentives contract only. Re-test on Arc Testnet with two or more wallets before mainnet: create several jars, break one (confirm the reward split lands on the *other* active jars, not the one that broke), let one mature and withdraw it (confirm reward + bonus + points all arrive), fund the bonus pool, check the 10-jar limit, and sweep owner fees.
+The completed project passes strict TypeScript checking, ESLint, and a production Next.js build.
 
-## Incentives
+The piggy-savings feature is covered by an in-memory-EVM behavioral suite (`.evmtest/goal-jar.test.js`, run with `node .evmtest/goal-jar.test.js`): goal-jar creation rules, bit-by-bit top-ups, goal overshoot rejection, goal-reached early withdrawal, break refusal after the goal, per-deposit-segment bonus/points math, penalty-share rewards preserved across top-ups, matured-jar guard rails, and the four-bucket accounting invariant. Result: **72 passed, 0 failed**.
 
-Three mechanisms reward a jar that reaches maturity. All three pay out only on
-`withdrawJar` - breaking early (`breakJar`) forfeits every one of them, which
-is what keeps "discipline fee" meaningful.
+The contract was also executed against an in-memory EVM with a 75-assertion behavioral suite covering:
 
-1. **Reward share.** Every time a jar is broken early, 80% of its 10% penalty
-   (8% of that jar's amount) is added to a reward pool and split, exactly
-   proportional to deposit size, among every jar still open at that moment.
-   The remaining 20% goes to the protocol (`ownerFeesAccrued`, swept with
-   `withdrawPenalties()`). This is self-funding: nothing is paid out that
-   wasn't first paid in by someone who broke a jar early. Uses the standard
-   "reward accumulator" pattern (`accRewardPerShare`), so the split needs no
-   loop over other users' jars - `createJar` sets a `rewardDebt` baseline,
-   and `pendingReward(user, jarId)` reads the current amount owed at any time.
+- constructor and network constants;
+- every `createJar` validation rule;
+- approval and balance movement;
+- duplicate-jar rejection;
+- locked withdrawal rejection;
+- 50% elapsed time travel;
+- exact 10% early-break accounting;
+- odd-unit integer rounding;
+- state cleanup;
+- maturity withdrawal;
+- event payloads;
+- owner-only penalty withdrawal;
+- penalty/deposit separation; and
+- attempted token reentrancy.
 
-2. **Time bonus.** A simple-interest annual rate (`bonusAprBps`, 5% by
-   default, owner-adjustable up to a 20% ceiling) on the amount held, for the
-   seconds actually held. Paid from `bonusPoolBalance`, which anyone can top
-   up with `fundBonusPool()` - this one is *not* self-funding, it needs real
-   USDC behind it. The payout is always capped at whatever the pool still
-   holds, so the contract can never go insolvent over this bonus.
-   `previewBonus(user, jarId)` shows the live estimate.
-
-3. **Points.** Every mature withdrawal earns non-transferable points, roughly
-   "USDC held x days held" (100 USDC held for 10 days = 1,000 points), tracked
-   forever in `points(address)`. `getTier(address)` turns a point total into
-   Bronze / Silver (1,000) / Gold (10,000) / Platinum (50,000). Points cost
-   the contract nothing - they are pure bookkeeping.
-
-**Accounting.** With three destinations for USDC now sharing one contract
-balance, each is tracked in its own explicit variable rather than derived from
-`balance - deposits` (the old approach for the single-fee version). The
-invariant, checked by `getAccountingSummary()` and by `npm run verify`:
-
-```
-balance == totalActiveDeposits + ownerFeesAccrued + rewardPoolBalance + bonusPoolBalance
-```
-
-One consequence worth knowing: USDC sent to the contract by any route other
-than `createJar`, `breakJar`, or `fundBonusPool` (a stray direct transfer,
-say) is not counted in any bucket above and is not claimable by the owner or
-anyone else - it just sits as inert slack no function reads.
+Result: **75 passed, 0 failed**.
 
 ## Compile the Contract
 

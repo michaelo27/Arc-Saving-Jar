@@ -31,6 +31,8 @@ export interface CreateJarFormProps {
     amount: string;
     durationSeconds: number;
     name: string;
+    /** Piggy-savings goal (""/omitted = classic jar). */
+    targetAmount?: string;
   }) => Promise<boolean>;
 }
 
@@ -99,6 +101,9 @@ export default function CreateJarForm({
   const [jarName, setJarName] = useState("");
   const [amountInput, setAmountInput] = useState("");
   const [durationSeconds, setDurationSeconds] = useState(DEFAULT_DURATION);
+  // Piggy savings: optional goal the jar is saving towards (e.g. a car).
+  const [goalEnabled, setGoalEnabled] = useState(false);
+  const [targetInput, setTargetInput] = useState("");
 
   /* ------------------------------ parsing -------------------------------- */
 
@@ -120,6 +125,25 @@ export default function CreateJarForm({
   const amount = parsedAmount.value ?? 0n;
   const balanceNumber = Number(formatUnits(usdcBalance, USDC_DECIMALS));
 
+  /* --------------------------- goal parsing ------------------------------- */
+
+  const parsedTarget = useMemo<{
+    value: bigint | null;
+    error: string | null;
+  }>(() => {
+    if (!goalEnabled || targetInput.trim().length === 0) return { value: null, error: null };
+    try {
+      return { value: parseUsdc(targetInput), error: null };
+    } catch (error) {
+      return {
+        value: null,
+        error: error instanceof Error ? error.message : "Invalid amount",
+      };
+    }
+  }, [goalEnabled, targetInput]);
+
+  const targetAmount = parsedTarget.value ?? 0n;
+
   /* ---------------------------- validation ------------------------------- */
 
   const nameTrimmed = jarName.trim();
@@ -136,12 +160,25 @@ export default function CreateJarForm({
       ? `Insufficient balance - you have ${formatUsdFromNumber(balanceNumber)} USDC`
       : null);
 
+  // Goal jar rules (mirrored from createGoalJar in SavingsJar.sol): the target
+  // must be a real amount and at least the initial deposit.
+  const goalError = !goalEnabled
+    ? null
+    : parsedTarget.error ??
+      (targetInput.trim().length > 0 && targetAmount === 0n
+        ? "The goal must be greater than 0"
+        : targetAmount > 0n && amount > 0n && targetAmount < amount
+          ? "The goal must be at least the deposit amount"
+          : null);
+  // While the goal is enabled the user owes us a valid target before creating.
+  const goalMissing = goalEnabled && targetInput.trim().length === 0;
+
   const hasAmount = amount > 0n;
   const canSubmitAmount = hasAmount && !amountError;
   const canSubmitName = nameTrimmed.length > 0 && !nameError;
   const allowanceCoversAmount = canSubmitAmount && allowance >= amount;
 
-  const formValid = canSubmitAmount && canSubmitName;
+  const formValid = canSubmitAmount && canSubmitName && !goalError && !goalMissing;
 
   /* ------------------------------ status --------------------------------- */
 
@@ -181,19 +218,23 @@ export default function CreateJarForm({
       amount: amountInput,
       durationSeconds,
       name: nameTrimmed,
+      targetAmount: goalEnabled ? targetInput.trim() : "",
     });
     await onCreateJar({
       amount: amountInput.trim(),
       durationSeconds,
       name: nameTrimmed,
+      targetAmount: goalEnabled ? targetInput.trim() : "",
     });
   }, [
     allowanceCoversAmount,
     amountInput,
     durationSeconds,
     formValid,
+    goalEnabled,
     nameTrimmed,
     onCreateJar,
+    targetInput,
   ]);
 
   const setPreset = useCallback((seconds: number) => {
@@ -299,6 +340,60 @@ export default function CreateJarForm({
               USDC
             </span>
           </div>
+        </Field>
+
+        {/* ----------------------------------------------------- savings goal */}
+        <Field
+          label="Savings Goal (optional)"
+          hint="Piggy savings 🐷 - top the jar up bit by bit"
+          error={goalError ?? (goalMissing ? "Enter the target amount" : null)}>
+          <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-navy-500 bg-navy-800/60 px-4 py-3 transition hover:border-accent/40">
+            <input
+              type="checkbox"
+              checked={goalEnabled}
+              onChange={(event) => setGoalEnabled(event.target.checked)}
+              className="mt-0.5 h-4 w-4 accent-[#00D4FF]"
+              aria-label="Save towards a goal"
+            />
+            <span className="text-sm">
+              <span className="font-medium text-white">Saving up for something?</span>
+              <span className="mt-0.5 block text-xs leading-relaxed text-muted">
+                Set a target amount. Add USDC whenever you can - once the jar
+                reaches the target you can withdraw early, or keep it locked
+                until maturity and earn more bonus.
+              </span>
+            </span>
+          </label>
+
+          {goalEnabled ? (
+            <div className="mt-3">
+              <div className="relative">
+                <input
+                  value={targetInput}
+                  onChange={(event) => setTargetInput(event.target.value)}
+                  placeholder="e.g. 5000.00"
+                  inputMode="decimal"
+                  autoComplete="off"
+                  className="input pr-20 font-mono"
+                  aria-invalid={Boolean(goalError) || goalMissing}
+                  aria-label="Target amount"
+                />
+                <span className="pointer-events-none absolute inset-y-0 right-4 flex items-center text-sm font-medium text-muted">
+                  USDC
+                </span>
+              </div>
+              {hasAmount && targetAmount >= amount && targetAmount > 0n ? (
+                <p className="mt-2 text-xs text-muted">
+                  Goal: <span className="font-mono text-accent">{formatUsdFromNumber(Number(formatUnits(targetAmount, USDC_DECIMALS)))}</span>{" "}
+                  · first deposit covers{" "}
+                  <span className="font-mono text-accent">
+                    {((Number(formatUnits(amount, USDC_DECIMALS)) / Number(formatUnits(targetAmount, USDC_DECIMALS))) * 100).toFixed(1)}%
+                  </span>{" "}
+                  of it
+                </p>
+              ) : null}
+            </div>
+          ) : null}
         </Field>
 
         {/* --------------------------------------------------------- duration */}
@@ -415,6 +510,8 @@ export default function CreateJarForm({
                 <>
                   <CheckIcon /> Jar Created! ✓
                 </>
+              ) : goalEnabled ? (
+                "2. Create Goal Jar 🎯"
               ) : (
                 "2. Create Jar 🫙"
               )}

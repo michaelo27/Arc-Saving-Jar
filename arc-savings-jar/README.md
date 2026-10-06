@@ -4,13 +4,13 @@
 
 Arc Savings Jar is a non-custodial savings mini-app on Arc Mainnet. A saver deposits USDC into a personal on-chain jar, chooses a lock between 24 hours and 365 days, and receives the full deposit back after the lock expires.
 
-The application is intentionally small, understandable, and useful: one wallet, one active jar, one savings goal.
+The application is intentionally small, understandable, and useful: one wallet can manage up to ten active jars, each with its own savings plan.
 
 ## What It Is
 
 Arc Savings Jar is a decentralized time-locked savings application built for Circle's EVM-compatible Arc blockchain. Funds are held by an immutable smart contract rather than by a company, administrator, or server.
 
-Each wallet can have one active jar. The saver chooses the amount, lock duration, and jar name; the contract enforces the deadline on-chain.
+Each wallet can have up to ten active jars. The saver chooses the amount, lock duration, and jar name; the contract enforces the deadline on-chain.
 
 ## The Problem It Solves
 
@@ -30,14 +30,34 @@ Arc Savings Jar introduces intentional friction without introducing a custodian.
 
 The application checks the existing ERC-20 allowance before requesting another approval. Every successful transaction triggers an immediate data refresh.
 
+## Piggy Savings - Goal Jars and Bit-by-Bit Top-Ups 🐷
+
+Alongside classic time-locked jars, a jar can optionally carry a **savings goal** - e.g. "New Car Fund, target 5,000 USDC". Goal jars add three abilities:
+
+1. **Create with a goal.** `createGoalJar(amount, lockDuration, name, targetAmount)` opens a jar whose target is at least the initial deposit. The create form exposes this as an optional "Savings Goal" toggle.
+2. **Top up bit by bit.** `addToJar(jarId, amount)` adds USDC to an existing locked jar whenever the saver has spare funds - the piggy-bank flow. Goal jars refuse top-ups that would overshoot the target; classic jars accept top-ups freely. Top-ups are allowed right up to the maturity date.
+3. **Withdraw at the goal - or wait.** The moment a goal jar's balance reaches its target, the saver can withdraw everything early with no penalty, or simply keep the jar locked until maturity and keep earning the time bonus. Breaking a jar whose goal is already reached is refused by the contract, since a full withdrawal is strictly better.
+4. **Invite gifts with a shareable link.** The owner can copy a jar-specific `/gift/{owner}/{jarId}/{generation}` link. Supporters choose an amount, approve USDC, and call `giftToJar`; donations are added directly to the owner’s active, still-locked jar. Goal jars cap gifts at the remaining target, and only the jar owner can withdraw under the jar’s rules. Gifts are irreversible once confirmed, so the gift page asks supporters to verify the recipient and amount. A monotonic generation protects against a stale link accidentally funding a later jar that reused the same slot.
+
+`giftToJar` and the generation counter require the updated contract. Existing deployments do not gain this function automatically; deploy the updated `SavingsJar.sol` before enabling live gifts.
+
+Incentive accounting stays exact across top-ups and gifts: each new deposit earns its reward share, time bonus, and points only for the time it was actually held. Each self top-up or gift banks accrued bonus/points and re-baselines the reward accumulator; `withdrawJar` pays the banked amounts plus the final deposit segment. The existing accounting invariant holds unchanged:
+
+```text
+balance == totalActiveDeposits + ownerFeesAccrued + rewardPoolBalance + bonusPoolBalance
+```
+
+Events: `JarToppedUp(user, jarId, added, newTotal)`, `JarGifted(donor, recipient, jarId, generation, amount, newTotal)`, and `GoalReached(user, jarId, totalSaved, targetAmount)`. Views: `isGoalReached(user, jarId)`, `goalRemaining(user, jarId)`, and `jarGeneration(owner, jarId)`. The public `/gift/{owner}/{jarId}/{generation}` page reads and verifies the jar version, enforces the remaining-goal limit in the UI, and guides supporters through USDC approval followed by the gift transaction.
+
 ## Product States
 
 The single-page interface conditionally renders four states:
 
 1. **Not connected** — product introduction, wallet connection, and feature cards.
-2. **Connected, no active jar** — jar creation form and two-step approval flow.
-3. **Active, locked jar** — liquid jar visual, second-by-second countdown, progress bar, and guarded emergency-break flow.
+2. **Connected, no active jar** — jar creation form (with the optional savings-goal toggle) and two-step approval flow.
+3. **Active, locked jar** — liquid jar visual, second-by-second countdown, progress bar, the 🐷 piggy-savings top-up card, a shareable gift-link card, and guarded emergency-break flow. The `/gift/{owner}/{jarId}/{generation}` page lets supporters contribute from their own wallet.
 4. **Unlocked jar** — completed jar, congratulations state, and one-click full withdrawal.
+5. **Goal reached** — a goal jar that hit its target early: withdraw everything now or wait for maturity and keep earning.
 
 A wallet-free reviewer walkthrough is available at [`/demo`](http://localhost:3000/demo). It uses mock read data and never broadcasts transactions.
 
@@ -73,8 +93,9 @@ Arc uses native USDC for gas at the EVM protocol layer. The ERC-20 USDC handled 
 
 ### Core Contract Rules
 
-- One active jar per wallet.
-- Amount must be greater than zero.
+- Up to ten active jars per wallet.
+- Third-party gifts require an active, still-locked jar and its current slot generation.
+- Deposits and gifts must be greater than zero; gifts cannot exceed a goal jar’s remaining target.
 - Minimum lock: 86,400 seconds (24 hours).
 - Maximum lock: 31,536,000 seconds (365 days).
 - Jar names must be non-empty and no longer than 48 bytes.
@@ -85,7 +106,7 @@ Arc uses native USDC for gas at the EVM protocol layer. The ERC-20 USDC handled 
 ### Security Properties
 
 - Checks-Effects-Interactions on every token exit path.
-- Reentrancy protection on create, withdraw, break, and penalty withdrawal flows.
+- Reentrancy protection on create, self top-ups, third-party gifts, withdraw, break, and penalty withdrawal flows.
 - User state is deleted before an outbound withdrawal interaction.
 - Safe ERC-20 wrappers support tokens that return `true` and tokens that return no value.
 - Token revert reasons are bubbled to the wallet where available.
@@ -105,12 +126,17 @@ arc-savings-jar/
 ├── app/
 │   ├── demo/page.tsx
 │   ├── globals.css
+│   ├── gift/[owner]/[jarId]/[generation]/page.tsx
 │   ├── layout.tsx
 │   └── page.tsx
 ├── components/
+│   ├── AddToJarCard.tsx
 │   ├── BreakJarModal.tsx
 │   ├── CountdownTimer.tsx
 │   ├── CreateJarForm.tsx
+│   ├── FundBonusPoolCard.tsx
+│   ├── GiftJarPage.tsx
+│   ├── GiftLinkCard.tsx
 │   ├── Header.tsx
 │   ├── JarDashboard.tsx
 │   ├── JarVisual.tsx
@@ -196,6 +222,8 @@ npm run build
 ```
 
 The completed project passes strict TypeScript checking, ESLint, and a production Next.js build.
+
+The piggy-savings and gift features are covered by an in-memory-EVM behavioral suite (`.evmtest/goal-jar.test.js`, run with `node .evmtest/goal-jar.test.js`): goal-jar creation rules, self top-ups and goal caps, third-party gifts and donor/owner rights, gift events, goal-reached withdrawal, per-deposit-segment bonus/points math, reward-share accounting, matured-jar guard rails, and the four-bucket accounting invariant. Result: **91 passed, 0 failed**.
 
 The contract was also executed against an in-memory EVM with a 75-assertion behavioral suite covering:
 

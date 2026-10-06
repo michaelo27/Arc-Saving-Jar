@@ -67,8 +67,8 @@ function txReducer(state: TxState, action: TxAction): TxState {
 }
 
 /** Stages where a wallet prompt or an on-chain confirmation is in flight. */
-const BUSY_STAGES: readonly TxStage[] = ["approving", "creating", "withdrawing", "breaking"];
-const DONE_STAGES: readonly TxStage[] = ["approved", "created", "withdrawn", "broken"];
+const BUSY_STAGES: readonly TxStage[] = ["approving", "creating", "toppingUp", "withdrawing", "breaking"];
+const DONE_STAGES: readonly TxStage[] = ["approved", "created", "toppedUp", "withdrawn", "broken"];
 
 /* -------------------------------------------------------------------------- */
 /*  Public types                                                              */
@@ -81,6 +81,13 @@ export interface CreateJarInput {
   durationSeconds: number;
   /** Label stored on-chain. */
   name: string;
+  /**
+   * Optional piggy-savings goal, e.g. "5000". When set (and >= `amount`) the
+   * jar is created via `createGoalJar`: it can then be topped up bit by bit
+   * with `addToJar` and withdrawn early once the balance reaches the target.
+   * Omit (or empty string) for a classic jar.
+   */
+  targetAmount?: string;
 }
 
 export interface UseSavingsJarResult {
@@ -136,6 +143,14 @@ export interface UseSavingsJarResult {
   jarPendingReward: bigint;
   /** This jar's time-weighted bonus if withdrawn right now (Incentive 2), already capped at the pool balance. */
   jarPreviewBonus: bigint;
+  /** Piggy-savings goal of the selected jar. `0n` = classic jar (no goal). */
+  jarTargetAmount: bigint;
+  /** True once the selected goal jar's balance has reached its target. */
+  isJarGoalReached: boolean;
+  /** 0-100 share of the selected jar's goal already saved (0 for classic jars). */
+  jarGoalProgressPercent: number;
+  /** USDC still needed for the selected jar to hit its goal (0n when none/reached). */
+  jarRemainingToGoal: bigint;
   /** Unix seconds at which the selected jar was created (0 when none). */
   createdAt: number;
   /** Total seconds this jar is locked for (unlockTime - createdAt). */
@@ -169,7 +184,13 @@ export interface UseSavingsJarResult {
 
   // --- writes ---------------------------------------------------------------
   createJar: (input: CreateJarInput) => Promise<boolean>;
-  /** Withdraw the selected jar (must be matured). */
+  /**
+   * Piggy savings: top up the selected jar with more USDC while it is locked.
+   * Goal jars refuse top-ups that would overshoot their target. Requires a
+   * matching ERC-20 approval first (same two-step flow as `createJar`).
+   */
+  addToJar: (amountText: string) => Promise<boolean>;
+  /** Withdraw the selected jar (matured, or a goal jar that reached its target). */
   withdrawJar: () => Promise<boolean>;
   /** Break the selected jar early (10% discipline fee). */
   breakJar: () => Promise<boolean>;
@@ -411,9 +432,24 @@ export function useSavingsJar(): UseSavingsJarResult {
 
       // Incentive 2: simple-interest time bonus, same formula as
       // SavingsJar.previewBonus(), capped at whatever the bonus pool still holds.
-      const heldSeconds = nowBig > slot.createdAt ? nowBig - slot.createdAt : 0n;
-      const rawBonus = (slot.amount * bonusAprBps * heldSeconds) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+      // With piggy-savings top-ups each deposit only earns from the moment it
+      // landed: bonus banked by earlier segments + interest on the current
+      // balance since the newest deposit (`lastFundedAt`).
+      const segmentSeconds = nowBig > slot.lastFundedAt ? nowBig - slot.lastFundedAt : 0n;
+      const rawBonus =
+        slot.bonusAccrued +
+        (slot.amount * bonusAprBps * segmentSeconds) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
       const previewBonus = rawBonus > bonusPoolBalance ? bonusPoolBalance : rawBonus;
+
+      // Piggy savings: goal progress (0 for classic jars, which have target 0).
+      const hasGoal = slot.targetAmount > 0n;
+      const isGoalReached = hasGoal && slot.amount >= slot.targetAmount;
+      const goalProgressPercent = hasGoal
+        ? Math.min(100, Number((slot.amount * 10_000n) / slot.targetAmount) / 100)
+        : 0;
+      const remainingToGoal = hasGoal && slot.amount < slot.targetAmount
+        ? slot.targetAmount - slot.amount
+        : 0n;
 
       active.push({
         id: index,
@@ -422,6 +458,10 @@ export function useSavingsJar(): UseSavingsJarResult {
           unlockTime: slot.unlockTime,
           createdAt: slot.createdAt,
           rewardDebt: slot.rewardDebt,
+          targetAmount: slot.targetAmount,
+          bonusAccrued: slot.bonusAccrued,
+          pointsAccrued: slot.pointsAccrued,
+          lastFundedAt: slot.lastFundedAt,
           isActive: slot.isActive,
           jarName: slot.jarName,
         },
@@ -431,6 +471,9 @@ export function useSavingsJar(): UseSavingsJarResult {
         isUnlocked: unlockTime <= now,
         pendingReward,
         previewBonus,
+        isGoalReached,
+        goalProgressPercent,
+        remainingToGoal,
       });
     });
     return active;
@@ -481,6 +524,10 @@ export function useSavingsJar(): UseSavingsJarResult {
   const unlockTimeSeconds = selectedJar ? selectedJar.unlockTime : 0;
   const jarPendingReward = selectedJar ? selectedJar.pendingReward : 0n;
   const jarPreviewBonus = selectedJar ? selectedJar.previewBonus : 0n;
+  const jarTargetAmount = selectedJar ? selectedJar.data.targetAmount : 0n;
+  const isJarGoalReached = selectedJar ? selectedJar.isGoalReached : false;
+  const jarGoalProgressPercent = selectedJar ? selectedJar.goalProgressPercent : 0;
+  const jarRemainingToGoal = selectedJar ? selectedJar.remainingToGoal : 0n;
 
   // `createdAt` is stored on-chain with each jar, so the exact lock length
   // survives a cold page load (needed for "time elapsed %").
@@ -690,20 +737,51 @@ export function useSavingsJar(): UseSavingsJarResult {
       dispatch({ type: "start", stage: "creating", message: "Creating Jar..." });
 
       const duration = BigInt(Math.floor(input.durationSeconds));
+
+      // Piggy savings: with a goal the jar is created via `createGoalJar` so it
+      // can be topped up bit by bit and cashed out once the target is reached.
+      const hasGoal =
+        typeof input.targetAmount === "string" && input.targetAmount.trim().length > 0;
+      let rawTarget = 0n;
+      if (hasGoal) {
+        try {
+          rawTarget = parseUsdc(input.targetAmount as string);
+        } catch (error) {
+          dispatch({
+            type: "fail",
+            message: error instanceof Error ? error.message : "Invalid goal amount",
+          });
+          return false;
+        }
+        if (rawTarget < rawAmount) {
+          dispatch({ type: "fail", message: "The savings goal must be at least the deposit amount." });
+          return false;
+        }
+      }
+
       console.log("[useSavingsJar] createJar ->", {
         amount: rawAmount.toString(),
         duration: duration.toString(),
         name: input.name,
+        target: hasGoal ? rawTarget.toString() : "(classic jar)",
       });
       const ok = await submitTx(
         () =>
-          writeContractAsync({
-            address: jarAddress,
-            abi: savingsJarAbi,
-            functionName: "createJar",
-            args: [rawAmount, duration, input.name],
-            chainId,
-          }),
+          hasGoal
+            ? writeContractAsync({
+                address: jarAddress,
+                abi: savingsJarAbi,
+                functionName: "createGoalJar",
+                args: [rawAmount, duration, input.name, rawTarget],
+                chainId,
+              })
+            : writeContractAsync({
+                address: jarAddress,
+                abi: savingsJarAbi,
+                functionName: "createJar",
+                args: [rawAmount, duration, input.name],
+                chainId,
+              }),
         "createJar",
       );
       if (!ok) return false;
@@ -713,6 +791,7 @@ export function useSavingsJar(): UseSavingsJarResult {
         amount: formatUnits(rawAmount, USDC_DECIMALS),
         durationSeconds: input.durationSeconds,
         name: input.name,
+        target: hasGoal ? formatUnits(rawTarget, USDC_DECIMALS) : null,
       });
       refetchAll();
 
@@ -731,6 +810,60 @@ export function useSavingsJar(): UseSavingsJarResult {
       return true;
     },
     [address, jarAddress, submitTx, writeContractAsync, chainId, refetchAll, refetchJars],
+  );
+
+  /**
+   * Piggy savings: top up the selected jar with more USDC while it is locked.
+   * Same two-step flow as `createJar` - the UI checks the allowance first and
+   * sends an approval when needed; the contract itself reverts top-ups that
+   * would overshoot a jar's goal or land after maturity.
+   */
+  const addToJar = useCallback(
+    async (amountText: string): Promise<boolean> => {
+      if (!address) {
+        dispatch({ type: "fail", message: "Connect your wallet first." });
+        return false;
+      }
+      if (selectedJarId === null) {
+        dispatch({ type: "fail", message: "Select a jar first." });
+        return false;
+      }
+
+      let rawAmount: bigint;
+      try {
+        rawAmount = parseUsdc(amountText);
+      } catch (error) {
+        dispatch({ type: "fail", message: error instanceof Error ? error.message : "Invalid amount" });
+        return false;
+      }
+      if (rawAmount === 0n) {
+        dispatch({ type: "fail", message: "Amount must be greater than 0" });
+        return false;
+      }
+
+      const jarId = BigInt(selectedJarId);
+      dispatch({ type: "start", stage: "toppingUp", message: "Adding USDC..." });
+
+      console.log("[useSavingsJar] addToJar ->", { jarId: jarId.toString(), amount: rawAmount.toString() });
+      const ok = await submitTx(
+        () =>
+          writeContractAsync({
+            address: jarAddress,
+            abi: savingsJarAbi,
+            functionName: "addToJar",
+            args: [jarId, rawAmount],
+            chainId,
+          }),
+        "addToJar",
+      );
+      if (!ok) return false;
+
+      dispatch({ type: "stage", stage: "toppedUp", message: "USDC added ✓" });
+      console.log(`[useSavingsJar] added ${formatUnits(rawAmount, USDC_DECIMALS)} USDC to jar ${selectedJarId}`);
+      refetchAll();
+      return true;
+    },
+    [address, jarAddress, selectedJarId, submitTx, writeContractAsync, chainId, refetchAll],
   );
 
   const withdrawJar = useCallback(async (): Promise<boolean> => {
@@ -881,6 +1014,10 @@ export function useSavingsJar(): UseSavingsJarResult {
     jarError: readError ? formatContractError(readError) : null,
     jarPendingReward,
     jarPreviewBonus,
+    jarTargetAmount,
+    isJarGoalReached,
+    jarGoalProgressPercent,
+    jarRemainingToGoal,
     createdAt,
     lockDurationSeconds,
     elapsedSeconds,
@@ -901,6 +1038,7 @@ export function useSavingsJar(): UseSavingsJarResult {
     totalBrokenReturned: totalBrokenQuery.data ?? 0n,
 
     createJar,
+    addToJar,
     withdrawJar,
     breakJar,
     approveUSDC,

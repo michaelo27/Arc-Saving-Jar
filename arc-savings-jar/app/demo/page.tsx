@@ -19,13 +19,14 @@ import type { JarData, JarTier, OwnedJar, TxState } from "@/lib/types";
  */
 
 type Jar = ReturnType<typeof useSavingsJar>;
-type DemoState = "1" | "2" | "3" | "4";
+type DemoState = "1" | "2" | "3" | "4" | "5";
 
 const STATES: readonly { id: DemoState; label: string; hint: string }[] = [
   { id: "1", label: "1 · Not connected", hint: "Landing page" },
   { id: "2", label: "2 · No active jar", hint: "Create form" },
-  { id: "3", label: "3 · Jar locked", hint: "Countdown + break flow" },
+  { id: "3", label: "3 · Jar locked", hint: "Countdown + piggy top-ups" },
   { id: "4", label: "4 · Jar unlocked", hint: "Withdraw" },
+  { id: "5", label: "5 · Goal reached", hint: "Withdraw early or wait" },
 ];
 
 const DEMO_ADDRESS = "0x7A51c9d3E4f0b8A6D2c1F5e9B0a4C8d7E6f1A2b3" as `0x${string}`;
@@ -101,8 +102,16 @@ function buildMockJar(
   const day = 86_400;
   const ninetyDays = 7_776_000;
 
-  // Jar 0: a jar created 45 days ago with a 90-day lock (exactly half served) -
-  // or, in state 4, one whose lock has just expired.
+  /** Shared zero values for the piggy-savings bookkeeping fields. */
+  const flat = {
+    bonusAccrued: 0n,
+    pointsAccrued: 0n,
+  };
+
+  // Jar 0: a goal jar ("New Car Fund") created 45 days ago with a 90-day lock.
+  // Piggy savings: the saver has topped it up bit by bit towards a 2,000 USDC
+  // target. In state 5 the latest top-up just hit the target, so the saver can
+  // withdraw early or wait for maturity. In state 4 the lock has expired.
   const vacationData: JarData =
     state === "4"
       ? {
@@ -110,24 +119,46 @@ function buildMockJar(
           unlockTime: BigInt(now - 60),
           createdAt: BigInt(now - 60 - ninetyDays),
           rewardDebt: 0n,
+          targetAmount: 0n,
+          ...flat,
+          lastFundedAt: BigInt(now - 60 - ninetyDays),
           isActive: true,
           jarName: "My Vacation Fund",
         }
-      : {
-          amount: 1_250_500_000n,
-          unlockTime: BigInt(now + ninetyDays / 2),
-          createdAt: BigInt(now - ninetyDays / 2),
-          rewardDebt: 0n,
-          isActive: true,
-          jarName: "My Vacation Fund",
-        };
+      : state === "5"
+        ? {
+            amount: 2_000_000_000n, // goal just reached
+            unlockTime: BigInt(now + 45 * day),
+            createdAt: BigInt(now - 45 * day),
+            rewardDebt: 0n,
+            targetAmount: 2_000_000_000n,
+            ...flat,
+            lastFundedAt: BigInt(now - 12 * 3_600),
+            isActive: true,
+            jarName: "New Car Fund",
+          }
+        : {
+            amount: 1_250_500_000n,
+            unlockTime: BigInt(now + ninetyDays / 2),
+            createdAt: BigInt(now - ninetyDays / 2),
+            rewardDebt: 0n,
+            targetAmount: 2_000_000_000n, // 62.5% of the way there
+            ...flat,
+            lastFundedAt: BigInt(now - 3 * day),
+            isActive: true,
+            jarName: "New Car Fund",
+          };
 
-  // Jar 1: a second, still-locked jar so the tabs have something to switch between.
+  // Jar 1: a second, still-locked classic jar (no goal) so the tabs have
+  // something to switch between.
   const emergencyData: JarData = {
     amount: 500_000_000n, // 500 USDC
     unlockTime: BigInt(now + 20 * day),
     createdAt: BigInt(now - 10 * day),
     rewardDebt: 0n,
+    targetAmount: 0n,
+    ...flat,
+    lastFundedAt: BigInt(now - 10 * day),
     isActive: true,
     jarName: "Emergency Fund",
   };
@@ -142,6 +173,7 @@ function buildMockJar(
 
   const toOwned = (id: number, data: JarData): OwnedJar => {
     const unlockTime = Number(data.unlockTime);
+    const hasGoal = data.targetAmount > 0n;
     return {
       id,
       data,
@@ -151,6 +183,11 @@ function buildMockJar(
       isUnlocked: unlockTime <= now,
       pendingReward: mockPendingReward(data),
       previewBonus: mockPreviewBonus(data),
+      isGoalReached: hasGoal && data.amount >= data.targetAmount,
+      goalProgressPercent: hasGoal
+        ? Math.min(100, Number((data.amount * 10_000n) / data.targetAmount) / 100)
+        : 0,
+      remainingToGoal: hasGoal && data.amount < data.targetAmount ? data.targetAmount - data.amount : 0n,
     };
   };
 
@@ -164,6 +201,10 @@ function buildMockJar(
     unlockTime: 0n,
     createdAt: 0n,
     rewardDebt: 0n,
+    targetAmount: 0n,
+    bonusAccrued: 0n,
+    pointsAccrued: 0n,
+    lastFundedAt: 0n,
     isActive: false,
     jarName: "",
   };
@@ -210,6 +251,10 @@ function buildMockJar(
     jarError: null,
     jarPendingReward: selected ? selected.pendingReward : 0n,
     jarPreviewBonus: selected ? selected.previewBonus : 0n,
+    jarTargetAmount: selected ? selected.data.targetAmount : 0n,
+    isJarGoalReached: selected ? selected.isGoalReached : false,
+    jarGoalProgressPercent: selected ? selected.goalProgressPercent : 0,
+    jarRemainingToGoal: selected ? selected.remainingToGoal : 0n,
     createdAt: selected ? selected.createdAt : 0,
     lockDurationSeconds: lockDuration,
     elapsedSeconds: active ? Math.max(0, lockDuration - timeRemaining) : 0,
@@ -228,6 +273,7 @@ function buildMockJar(
     totalBrokenReturned: 1_155_600_000n,
 
     createJar: noopWrite,
+    addToJar: noopWrite,
     withdrawJar: noopWrite,
     breakJar: noopWrite,
     approveUSDC: noopWrite,

@@ -2,10 +2,12 @@
 
 import { useCallback, useState } from "react";
 
+import AddToJarCard from "@/components/AddToJarCard";
 import BreakJarModal from "@/components/BreakJarModal";
 import CountdownTimer from "@/components/CountdownTimer";
 import CreateJarForm from "@/components/CreateJarForm";
 import FundBonusPoolCard from "@/components/FundBonusPoolCard";
+import GiftLinkCard from "@/components/GiftLinkCard";
 import JarVisual from "@/components/JarVisual";
 import StatusBadge from "@/components/StatusBadge";
 import { EXPLORER_URL, SAVINGS_JAR_ADDRESS, USDC_ADDRESS } from "@/config/contracts";
@@ -86,6 +88,13 @@ export default function JarDashboard({ jar, demo = false }: JarDashboardProps) {
               discipline!
             </p>
 
+            {jar.jarTargetAmount > 0n ? (
+              <span className="mt-3 rounded-full border border-gold/40 bg-gold/10 px-3 py-1 text-xs font-semibold text-gold">
+                🎯 Goal {jar.jarData.amount >= jar.jarTargetAmount ? "reached" : "jar"} · target{" "}
+                {formatUsd(jar.jarTargetAmount)}
+              </span>
+            ) : null}
+
             {jar.jarPendingReward > 0n || jar.jarPreviewBonus > 0n ? (
               <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-xs">
                 {jar.jarPendingReward > 0n ? (
@@ -163,6 +172,43 @@ export default function JarDashboard({ jar, demo = false }: JarDashboardProps) {
               isUnlocked={false}
             />
 
+            {/* Piggy savings: goal reached before maturity -> the saver picks:
+                withdraw everything now, or keep it locked until maturity. */}
+            {jar.isJarGoalReached ? (
+              <div className="mt-6 w-full max-w-md rounded-2xl border border-gold/45 bg-gold/10 px-5 py-4 text-center">
+                <p className="text-sm font-semibold text-gold">
+                  🎯 Goal reached -{" "}
+                  <span className="font-mono">{formatUsd(jar.jarData.amount)}</span> saved!
+                </p>
+                <p className="mt-1.5 text-xs leading-relaxed text-muted">
+                  Withdraw everything now, or wait for the maturity date and
+                  keep earning the time bonus. Your call.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleWithdraw}
+                  disabled={jar.isLoading}
+                  className="btn-success mt-3 w-full"
+                >
+                  {jar.tx.stage === "withdrawing" ? (
+                    <>
+                      <Spinner /> Withdrawing...
+                    </>
+                  ) : jar.tx.stage === "withdrawn" ? (
+                    <>Withdrawn ✓</>
+                  ) : (
+                    <>
+                      Withdraw{" "}
+                      {formatUsd(
+                        jar.jarData.amount + jar.jarPendingReward + jar.jarPreviewBonus,
+                      )}{" "}
+                      USDC now
+                    </>
+                  )}
+                </button>
+              </div>
+            ) : null}
+
             <CountdownTimer
               unlockTimestamp={Number(jar.jarData.unlockTime)}
               className="mt-8 w-full max-w-md"
@@ -213,6 +259,37 @@ export default function JarDashboard({ jar, demo = false }: JarDashboardProps) {
               </p>
             ) : null}
 
+            {/* Piggy savings: top the jar up bit by bit while it is locked. */}
+            <div className="mt-6 w-full max-w-md">
+              <AddToJarCard
+                jarAmount={amount}
+                targetAmount={jar.jarTargetAmount}
+                isGoalReached={jar.isJarGoalReached}
+                usdcBalance={jar.usdcBalance}
+                allowance={jar.allowance}
+                tx={jar.tx}
+                onApprove={jar.approveUSDC}
+                onAdd={jar.addToJar}
+              />
+              {demo ? (
+                <div className="mt-5 w-full max-w-md rounded-2xl border border-accent/25 bg-accent/5 p-5 text-left">
+                  <h3 className="text-sm font-semibold text-white">🎁 Share a gift link</h3>
+                  <p className="mt-1.5 text-xs leading-relaxed text-muted">
+                    Live jars can generate a link for supporters. This mock walkthrough does not create payment links or send transactions.
+                  </p>
+                </div>
+              ) : (
+                <GiftLinkCard
+                  ownerAddress={jar.address}
+                  jarId={jar.selectedJarId}
+                  jarName={jar.jarData.jarName}
+                  jarAmount={amount}
+                  targetAmount={jar.jarTargetAmount}
+                  canReceiveGift={!jar.isJarGoalReached}
+                />
+              )}
+            </div>
+
             <div className="mt-8 flex w-full max-w-md flex-col items-center gap-3">
               <StatusBadge
                 status={badgeFor(jar.tx.stage, jar.tx.error)}
@@ -220,24 +297,33 @@ export default function JarDashboard({ jar, demo = false }: JarDashboardProps) {
               />
               {jar.txHash ? <TxLink hash={jar.txHash} /> : null}
 
-              <button
-                type="button"
-                onClick={() => {
-                  console.log("[JarDashboard] opening break-jar confirmation");
-                  setBreakOpen(true);
-                }}
-                disabled={jar.isLoading}
-                className="btn-danger w-full"
-              >
-                🚨 Break Jar (10% Penalty)
-              </button>
-              <p className="text-center text-xs text-muted">
-                Breaking early returns{" "}
-                <span className="font-mono text-white">{formatUsd(returnedAfterPenalty(amount))}</span>{" "}
-                and keeps{" "}
-                <span className="font-mono text-gold">{formatUsd(penaltyOf(amount))}</span> in the
-                contract as a discipline fee.
-              </p>
+              {jar.isJarGoalReached ? (
+                <p className="text-center text-xs text-muted">
+                  This jar hit its goal, so the contract refuses to break it -
+                  a full withdrawal is always the better move here.
+                </p>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      console.log("[JarDashboard] opening break-jar confirmation");
+                      setBreakOpen(true);
+                    }}
+                    disabled={jar.isLoading}
+                    className="btn-danger w-full"
+                  >
+                    🚨 Break Jar (10% Penalty)
+                  </button>
+                  <p className="text-center text-xs text-muted">
+                    Breaking early returns{" "}
+                    <span className="font-mono text-white">{formatUsd(returnedAfterPenalty(amount))}</span>{" "}
+                    and keeps{" "}
+                    <span className="font-mono text-gold">{formatUsd(penaltyOf(amount))}</span> in the
+                    contract as a discipline fee.
+                  </p>
+                </>
+              )}
             </div>
           </section>
 
@@ -322,7 +408,9 @@ function JarTabs({ jar }: { jar: Jar }) {
             aria-pressed={selected}
             className={`${tabBase} ${selected ? tabOn : tabOff}`}
           >
-            <span aria-hidden="true">{entry.isUnlocked ? "🔓" : "🫙"}</span>
+            <span aria-hidden="true">
+              {entry.isUnlocked ? "🔓" : entry.data.targetAmount > 0n ? "🎯" : "🫙"}
+            </span>
             <span className="max-w-[10rem] truncate font-medium">
               {entry.data.jarName || `Jar ${entry.id + 1}`}
             </span>
@@ -442,6 +530,13 @@ function Aside({ jar, className = "" }: { jar: Jar; className?: string }) {
           {jar.isJarActive ? (
             <>
               <StatRow label="This jar" value={formatUsd(jar.jarData.amount)} tone="accent" />
+              {jar.jarTargetAmount > 0n ? (
+                <StatRow
+                  label="Savings goal"
+                  value={`${formatUsd(jar.jarTargetAmount)} (${jar.jarGoalProgressPercent.toFixed(0)}%)`}
+                  tone="gold"
+                />
+              ) : null}
               <StatRow
                 label="Lock length"
                 value={jar.lockDurationSeconds > 0 ? formatDuration(jar.lockDurationSeconds) : "—"}
@@ -593,8 +688,8 @@ function Footer() {
 
 function badgeFor(stage: string, error: string | null): "idle" | "loading" | "success" | "error" {
   if (stage === "error" || error) return "error";
-  if (["approving", "creating", "withdrawing", "breaking"].includes(stage)) return "loading";
-  if (["approved", "created", "withdrawn", "broken"].includes(stage)) return "success";
+  if (["approving", "creating", "toppingUp", "withdrawing", "breaking"].includes(stage)) return "loading";
+  if (["approved", "created", "toppedUp", "withdrawn", "broken"].includes(stage)) return "success";
   return "idle";
 }
 

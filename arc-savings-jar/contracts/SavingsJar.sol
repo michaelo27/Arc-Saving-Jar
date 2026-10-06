@@ -19,6 +19,23 @@ pragma solidity ^0.8.20;
  *         what funds the reward pool for everyone else (see below) - the
  *         jar that breaks earns nothing from it.
  *
+ * @dev Piggy savings - goal jars and bit-by-bit top-ups
+ *      A jar may optionally carry a savings goal (e.g. "car fund"):
+ *      1. `createGoalJar(amount, lockDuration, jarName, targetAmount)` opens
+ *         a jar with a target of at least the initial deposit. Plain
+ *         `createJar(...)` keeps working exactly as before (target = 0).
+ *      2. `addToJar(jarId, amount)` tops the jar up at any time while it is
+ *         still locked. Goal jars refuse top-ups that would overshoot the
+ *         target. Every top-up re-baselines the incentive bookkeeping
+ *         (reward debt, banked bonus, banked points) so each deposit only
+ *         ever earns for the time *that* deposit was actually held.
+ *      3. The moment a goal jar's balance reaches its target, the saver may
+ *         `withdrawJar(jarId)` immediately - a goal-reached withdrawal is a
+ *         full mature withdrawal (reward share, time bonus and points all
+ *         paid) - or simply wait for the maturity date and keep earning.
+ *         Breaking a jar whose goal is already reached is refused, since
+ *         withdrawing in full is strictly better.
+ *
  * @dev Incentives - three mechanisms, all paid only on a MATURE withdrawal
  *      (never on an early break, which keeps the "discipline" story intact):
  *
@@ -84,12 +101,16 @@ contract SavingsJar {
     // =========================================================================
 
     struct JarData {
-        uint256 amount;     // Deposited USDC, raw units (6 decimals)
-        uint256 unlockTime; // Unix timestamp (seconds) when funds unlock
-        uint256 createdAt;  // Unix timestamp (seconds) when the jar was created
-        uint256 rewardDebt; // Reward-accumulator baseline at creation - see accRewardPerShare
-        bool isActive;      // Whether this slot currently holds an active jar
-        string jarName;     // User supplied label for the jar
+        uint256 amount;        // Deposited USDC incl. top-ups, raw units (6 decimals)
+        uint256 unlockTime;    // Unix timestamp (seconds) when funds unlock
+        uint256 createdAt;     // Unix timestamp (seconds) when the jar was created
+        uint256 rewardDebt;    // Reward-accumulator baseline - see accRewardPerShare
+        uint256 targetAmount;  // Piggy-savings goal, raw units. 0 = classic jar (no goal)
+        uint256 bonusAccrued;  // Time bonus already banked by earlier deposit segments
+        uint256 pointsAccrued; // Points (USDC-days) already banked by earlier segments
+        uint256 lastFundedAt;  // Unix timestamp (seconds) of the newest deposit
+        bool isActive;         // Whether this slot currently holds an active jar
+        string jarName;        // User supplied label for the jar
     }
 
     // =========================================================================
@@ -169,6 +190,7 @@ contract SavingsJar {
 
     // ---- Lifetime counters (analytics only, no logic depends on these) ----------
     uint256 public totalJarsCreated;
+    uint256 public totalToppedUp;        // lifetime USDC added via top-ups and gifts
     uint256 public totalWithdrawn;       // principal only
     uint256 public totalBrokenReturned;  // principal only
     uint256 public totalPenaltiesCollected; // lifetime penalty, owner + reward combined
@@ -177,6 +199,11 @@ contract SavingsJar {
 
     /// @dev Optimistic reentrancy flag.
     bool private _locked;
+
+    /// @notice Monotonic version for each reusable owner/slot pair. Gift links
+    ///         bind to this value so an old link cannot target a later jar that
+    ///         reuses the same slot after withdrawal.
+    mapping(address => mapping(uint256 => uint256)) public jarGeneration;
 
     // =========================================================================
     // Events
@@ -187,7 +214,29 @@ contract SavingsJar {
         uint256 indexed jarId,
         uint256 amount,
         uint256 unlockTime,
-        string jarName
+        string jarName,
+        uint256 targetAmount
+    );
+    event JarToppedUp(
+        address indexed user,
+        uint256 indexed jarId,
+        uint256 added,
+        uint256 newTotal
+    );
+    /// @notice A supporter gifted USDC into another wallet's active jar.
+    event JarGifted(
+        address indexed donor,
+        address indexed recipient,
+        uint256 indexed jarId,
+        uint256 generation,
+        uint256 amount,
+        uint256 newTotal
+    );
+    event GoalReached(
+        address indexed user,
+        uint256 indexed jarId,
+        uint256 totalSaved,
+        uint256 targetAmount
     );
     event JarWithdrawn(
         address indexed user,
@@ -248,14 +297,51 @@ contract SavingsJar {
 
     /**
      * @notice Lock `_amount` of USDC for `_lockDurationInSeconds` in a new jar.
-     * @dev    Caller must have approved this contract for at least `_amount`.
-     *         Reverts when the wallet already has `MAX_JARS_PER_WALLET` active jars.
+     * @dev    Classic jar with no savings goal (target = 0). Caller must have
+     *         approved this contract for at least `_amount`. Reverts when the
+     *         wallet already has `MAX_JARS_PER_WALLET` active jars.
      */
     function createJar(
         uint256 _amount,
         uint256 _lockDurationInSeconds,
         string memory _jarName
-    ) external nonReentrant returns (uint256 jarId) {
+    ) external returns (uint256 jarId) {
+        return _createJar(_amount, _lockDurationInSeconds, _jarName, 0);
+    }
+
+    /**
+     * @notice Piggy-savings jar: same as `createJar`, plus a `_targetAmount`
+     *         goal (e.g. saving up for a car). The jar can then be topped up
+     *         bit by bit with `addToJar`, and once its balance reaches the
+     *         target the saver may withdraw early instead of waiting for the
+     *         maturity date.
+     * @dev    Requires `_targetAmount >= _amount` - the goal can never sit
+     *         below what is already in the jar.
+     */
+    function createGoalJar(
+        uint256 _amount,
+        uint256 _lockDurationInSeconds,
+        string memory _jarName,
+        uint256 _targetAmount
+    ) external returns (uint256 jarId) {
+        require(
+            _targetAmount >= _amount,
+            "SavingsJar: goal must be at least the initial deposit"
+        );
+        return _createJar(_amount, _lockDurationInSeconds, _jarName, _targetAmount);
+    }
+
+    /**
+     * @dev Shared body of `createJar` / `createGoalJar`. `_targetAmount == 0`
+     *      means a classic jar with no goal. Reentrancy-guarded because it
+     *      pulls tokens from the caller.
+     */
+    function _createJar(
+        uint256 _amount,
+        uint256 _lockDurationInSeconds,
+        string memory _jarName,
+        uint256 _targetAmount
+    ) internal nonReentrant returns (uint256 jarId) {
         // ---------------- Checks ----------------
         require(_amount > 0, "SavingsJar: amount must be greater than 0");
         require(
@@ -287,9 +373,12 @@ contract SavingsJar {
         // ---------------- Effects ----------------
         uint256 unlockTime = block.timestamp + _lockDurationInSeconds;
         JarData storage jar = userJars[jarId];
+        jarGeneration[msg.sender][jarId] += 1;
         jar.amount = _amount;
         jar.unlockTime = unlockTime;
         jar.createdAt = block.timestamp;
+        jar.lastFundedAt = block.timestamp;
+        jar.targetAmount = _targetAmount;
         jar.jarName = _jarName;
         jar.isActive = true;
         // Baseline the reward accumulator now, so this jar only earns rewards
@@ -302,14 +391,117 @@ contract SavingsJar {
         // ---------------- Interactions ----------------
         _safeTransferFrom(address(usdc), msg.sender, address(this), _amount);
 
-        emit JarCreated(msg.sender, jarId, _amount, unlockTime, _jarName);
+        emit JarCreated(msg.sender, jarId, _amount, unlockTime, _jarName, _targetAmount);
     }
 
     /**
-     * @notice Withdraw jar `_jarId` once its lock has expired. Pays the full
-     *         principal plus this jar's share of the reward pool, plus its
-     *         time-weighted bonus (if the bonus pool has funds), and credits
-     *         points for the time held.
+     * @notice Piggy savings: top jar `_jarId` up with `_amount` more USDC
+     *         while it is still locked - e.g. adding a little every week
+     *         towards the jar's goal. Works on classic jars too.
+     * @dev    Goal jars refuse top-ups that would overshoot `targetAmount`.
+     *         The incentive bookkeeping is re-baselined on every top-up:
+     *         - rewardDebt moves up so only penalties paid *after* the top-up
+     *           count for the new amount (pending rewards are preserved),
+     *         - the time bonus and points earned by the previous balance are
+     *           banked into `bonusAccrued` / `pointsAccrued`, so each deposit
+     *           segment only ever earns for the time it was actually held.
+     */
+    function addToJar(uint256 _jarId, uint256 _amount) external nonReentrant {
+        _topUpJar(msg.sender, _jarId, _amount);
+    }
+
+    /**
+     * @notice Gift USDC into another wallet's active jar. The gift becomes
+     *         part of the jar owner's balance and can only be withdrawn by
+     *         that owner under the jar's normal goal and lock rules.
+     * @dev    The donor must approve this contract to spend `_amount` USDC.
+     *         `_expectedGeneration` prevents an old share link from funding a
+     *         new jar after the owner reuses this slot. Goal limits, maturity
+     *         checks and incentive accounting match `addToJar`. Gifts are
+     *         irreversible once confirmed.
+     */
+    function giftToJar(
+        address _jarOwner,
+        uint256 _jarId,
+        uint256 _amount,
+        uint256 _expectedGeneration
+    ) external nonReentrant {
+        require(_jarOwner != address(0), "SavingsJar: jar owner is zero");
+        require(
+            _expectedGeneration != 0 && jarGeneration[_jarOwner][_jarId] == _expectedGeneration,
+            "SavingsJar: stale gift link"
+        );
+        _topUpJar(_jarOwner, _jarId, _amount);
+        emit JarGifted(
+            msg.sender,
+            _jarOwner,
+            _jarId,
+            _expectedGeneration,
+            _amount,
+            jars[_jarOwner][_jarId].amount
+        );
+    }
+
+    /**
+     * @dev Shared top-up path for an owner's own deposit and a third-party
+     *      gift. `msg.sender` supplies the USDC in both cases, while `_jarOwner`
+     *      determines which jar receives the funds and earns future incentives.
+     */
+    function _topUpJar(address _jarOwner, uint256 _jarId, uint256 _amount)
+        internal
+    {
+        JarData[] storage userJars = jars[_jarOwner];
+
+        // ---------------- Checks ----------------
+        require(_jarId < userJars.length, "SavingsJar: invalid jar id");
+        JarData storage jar = userJars[_jarId];
+        require(jar.isActive, "SavingsJar: no active jar to add to");
+        require(_amount > 0, "SavingsJar: amount must be greater than 0");
+        require(block.timestamp < jar.unlockTime, "SavingsJar: jar already matured, withdraw it");
+        uint256 newAmount = jar.amount + _amount;
+        require(
+            jar.targetAmount == 0 || newAmount <= jar.targetAmount,
+            "SavingsJar: top-up would exceed the savings goal"
+        );
+
+        // ---------------- Effects ----------------
+        // Bank what the previous balance earned up to now (this deposit
+        // segment ends here; a new, larger segment starts).
+        uint256 segmentSeconds = block.timestamp - jar.lastFundedAt;
+        jar.bonusAccrued +=
+            (jar.amount * bonusAprBps * segmentSeconds) /
+            (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+        jar.pointsAccrued += (jar.amount * segmentSeconds) / (USDC_UNIT * 1 days);
+
+        // Preserve this jar's unclaimed penalty-share reward across the
+        // top-up by moving the debt up with the new amount.
+        uint256 accrued = (jar.amount * accRewardPerShare) / ACC_PRECISION;
+        uint256 pending = accrued > jar.rewardDebt ? accrued - jar.rewardDebt : 0;
+        jar.rewardDebt = (newAmount * accRewardPerShare) / ACC_PRECISION - pending;
+
+        jar.amount = newAmount;
+        jar.lastFundedAt = block.timestamp;
+        totalActiveDeposits += _amount;
+        totalToppedUp += _amount;
+
+        // ---------------- Interactions ----------------
+        _safeTransferFrom(address(usdc), msg.sender, address(this), _amount);
+
+        emit JarToppedUp(_jarOwner, _jarId, _amount, newAmount);
+        if (jar.targetAmount > 0 && newAmount >= jar.targetAmount) {
+            emit GoalReached(_jarOwner, _jarId, newAmount, jar.targetAmount);
+        }
+    }
+
+    /**
+     * @notice Withdraw jar `_jarId` once its lock has expired - or, for a goal
+     *         jar, as soon as its balance has reached the target. Pays the
+     *         full principal plus this jar's share of the reward pool, plus
+     *         its time-weighted bonus (if the bonus pool has funds), and
+     *         credits points for the time held. A goal-reached withdrawal is
+     *         a fully mature withdrawal - nothing is forfeited - but the
+     *         saver may also ignore the goal and wait for the maturity date
+     *         to keep earning the time bonus.
      */
     function withdrawJar(uint256 _jarId) external nonReentrant {
         JarData[] storage userJars = jars[msg.sender];
@@ -318,20 +510,28 @@ contract SavingsJar {
         require(_jarId < userJars.length, "SavingsJar: invalid jar id");
         JarData storage jar = userJars[_jarId];
         require(jar.isActive, "SavingsJar: no active jar to withdraw");
-        require(block.timestamp >= jar.unlockTime, "SavingsJar: jar is still locked");
+        bool matured = block.timestamp >= jar.unlockTime;
+        bool goalReached = jar.targetAmount > 0 && jar.amount >= jar.targetAmount;
+        require(matured || goalReached, "SavingsJar: jar is still locked");
 
         uint256 amount = jar.amount;
-        uint256 heldSeconds = block.timestamp - jar.createdAt;
+        uint256 segmentSeconds = block.timestamp - jar.lastFundedAt;
 
         // Incentive 1: this jar's exact share of every penalty paid while it was open.
         uint256 reward = (amount * accRewardPerShare) / ACC_PRECISION - jar.rewardDebt;
 
-        // Incentive 2: simple-interest time bonus, capped so the pool can never go negative.
-        uint256 bonus = (amount * bonusAprBps * heldSeconds) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+        // Incentive 2: banked bonus of earlier deposit segments + simple interest
+        // on the current balance since the last deposit; capped so the pool can
+        // never go negative.
+        uint256 bonus = jar.bonusAccrued +
+            (amount * bonusAprBps * segmentSeconds) /
+            (BPS_DENOMINATOR * SECONDS_PER_YEAR);
         if (bonus > bonusPoolBalance) bonus = bonusPoolBalance;
 
-        // Incentive 3: points, roughly "USDC held x days held". E.g. 100 USDC for 10 days = 1,000 points.
-        uint256 pointsEarned = (amount * heldSeconds) / (USDC_UNIT * 1 days);
+        // Incentive 3: points, roughly "USDC held x days held", banked per
+        // deposit segment. E.g. 100 USDC for 10 days = 1,000 points.
+        uint256 pointsEarned = jar.pointsAccrued +
+            (amount * segmentSeconds) / (USDC_UNIT * 1 days);
 
         // ---------------- Effects ----------------
         delete userJars[_jarId];
@@ -367,6 +567,12 @@ contract SavingsJar {
         JarData storage jar = userJars[_jarId];
         require(jar.isActive, "SavingsJar: no active jar to break");
         require(block.timestamp < jar.unlockTime, "SavingsJar: jar already unlocked, use withdrawJar");
+        // A jar whose goal is reached can be withdrawn in full - breaking it
+        // would needlessly burn 10%, so refuse instead of letting users footgun.
+        require(
+            jar.targetAmount == 0 || jar.amount < jar.targetAmount,
+            "SavingsJar: goal reached, use withdrawJar"
+        );
 
         // ---------------- Effects ----------------
         uint256 amount = jar.amount;
@@ -513,14 +719,42 @@ contract SavingsJar {
     /**
      * @notice The time-weighted bonus jar `_jarId` would receive right now
      *         (Incentive 2), already capped at the pool's remaining balance.
+     *         Banked bonus from earlier deposit segments plus simple interest
+     *         on the current balance since the last top-up.
      */
     function previewBonus(address _user, uint256 _jarId) external view returns (uint256) {
         if (_jarId >= jars[_user].length) return 0;
         JarData storage jar = jars[_user][_jarId];
         if (!jar.isActive) return 0;
-        uint256 heldSeconds = block.timestamp > jar.createdAt ? block.timestamp - jar.createdAt : 0;
-        uint256 bonus = (jar.amount * bonusAprBps * heldSeconds) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+        uint256 segmentSeconds = block.timestamp > jar.lastFundedAt
+            ? block.timestamp - jar.lastFundedAt
+            : 0;
+        uint256 bonus = jar.bonusAccrued +
+            (jar.amount * bonusAprBps * segmentSeconds) /
+            (BPS_DENOMINATOR * SECONDS_PER_YEAR);
         return bonus > bonusPoolBalance ? bonusPoolBalance : bonus;
+    }
+
+    /**
+     * @notice True once a goal jar's balance has reached its target. The jar
+     *         can then be withdrawn early with `withdrawJar` - or the saver
+     *         can simply wait for maturity and keep earning.
+     */
+    function isGoalReached(address _user, uint256 _jarId) external view returns (bool) {
+        if (_jarId >= jars[_user].length) return false;
+        JarData storage jar = jars[_user][_jarId];
+        return jar.isActive && jar.targetAmount > 0 && jar.amount >= jar.targetAmount;
+    }
+
+    /**
+     * @notice USDC still needed for jar `_jarId` to hit its savings goal.
+     *         0 for classic jars (no goal) or once the goal is reached.
+     */
+    function goalRemaining(address _user, uint256 _jarId) external view returns (uint256) {
+        if (_jarId >= jars[_user].length) return 0;
+        JarData storage jar = jars[_user][_jarId];
+        if (!jar.isActive || jar.targetAmount == 0) return 0;
+        return jar.amount >= jar.targetAmount ? 0 : jar.targetAmount - jar.amount;
     }
 
     /**

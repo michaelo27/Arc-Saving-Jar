@@ -1,0 +1,2 @@
+# Local QA harness dependencies (install with `npm install` inside .evmtest)
+.evmtest/node_modules

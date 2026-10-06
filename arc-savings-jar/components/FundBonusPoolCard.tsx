@@ -126,9 +126,9 @@ export default function FundBonusPoolCard({
 
       <p className="mt-1.5 text-xs leading-relaxed text-muted">
         Unlike the reward share (funded automatically by early-break penalties), the{" "}
-        {(Number(bonusAprBps) / 100).toFixed(2)}%/year time bonus is only paid from what's in
+        {(Number(bonusAprBps) / 100).toFixed(2)}%/year time bonus is only paid from what&apos;s in
         this pool - currently <span className="font-mono text-gold">{bonusPoolBalanceFormatted} USDC</span>.
-        Anyone can top it up; there's no minimum.
+        Anyone can top it up; there&apos;s no minimum.
       </p>
 
       <div className="mt-3">
